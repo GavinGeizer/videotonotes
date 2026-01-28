@@ -20,9 +20,9 @@ export default function Home() {
 
   const helperText = useMemo(() => {
     if (status === "uploading") return "Uploading video…";
-    if (status === "processing") return "Calling Gemini stub…";
+    if (status === "processing") return "Calling Gemini…";
     if (status === "done") return "Complete.";
-    return "Paste a YouTube URL or upload an .mp4/.mov/.webm file.";
+    return "Paste a YouTube URL or upload an .mp4/.mov/.webm file (up to 2 GB).";
   }, [status]);
 
   async function handleSubmit(event: FormEvent) {
@@ -73,8 +73,8 @@ export default function Home() {
           </h1>
           <p className="max-w-2xl text-base text-zinc-600">
             Upload an .mp4 (or .mov/.webm) or drop in a YouTube link. The backend
-            will hand it to Gemini (stubbed here) and return a transcript plus a
-            concise note bundle.
+            will hand it to Gemini and return a transcript plus a concise note
+            bundle.
           </p>
         </header>
 
@@ -141,8 +141,8 @@ export default function Home() {
                   </span>
                 ) : (
                   <span className="text-xs text-zinc-500">
-                    Max preview size limited by server defaults (~4–5 MB unless
-                    adjusted).
+                    Files up to 2 GB are supported; processing time varies with
+                    size.
                   </span>
                 )}
               </label>
@@ -161,11 +161,11 @@ export default function Home() {
                 >
                   {status === "uploading" || status === "processing"
                     ? "Processing…"
-                    : "Send to Gemini (stub)"}
+                    : "Send to Gemini"}
                 </button>
                 <p className="text-xs text-zinc-500">
-                  We do not persist uploads in this stub. Wire storage + Gemini
-                  SDK before production.
+                  Files are streamed directly to Gemini. YouTube URL processing
+                  depends on Gemini URL access.
                 </p>
               </div>
             </form>

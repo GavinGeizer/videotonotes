@@ -1,3 +1,5 @@
+import { GoogleGenAI } from "@google/genai";
+
 export type GeminiSource =
   | {
       type: "youtube";
@@ -5,6 +7,7 @@ export type GeminiSource =
     }
   | {
       type: "upload";
+      file: Blob;
       fileName: string;
       mimeType: string;
       sizeBytes: number;
@@ -17,30 +20,121 @@ export type GeminiResult = {
   estimatedCostUsd: number;
 };
 
-/**
- * Placeholder Gemini caller.
- *
- * Swap this stub with a real Gemini SDK call. For example (pseudo-code):
- * const client = new GoogleGenerativeAI({ apiKey: process.env.GEMINI_API_KEY });
- * const model = client.getGenerativeModel({ model: "gemini-1.5-flash" });
- * const response = await model.generateContent({ contents: [...] });
- */
+const GEMINI_MODEL = "gemini-1.5-flash";
+
+function buildPrompt(source: GeminiSource) {
+  if (source.type === "youtube") {
+    return [
+      "You are a transcription assistant. If you cannot access the video contents for the URL",
+      "below, respond with a single JSON object that includes an empty transcript and notes plus",
+      "a brief message explaining that the URL cannot be accessed.",
+      `Video URL: ${source.videoUrl}`,
+      "",
+      "Respond with JSON in this format:",
+      '{"transcript":"...","notes":["...","..."]}',
+    ].join("\n");
+  }
+
+  return [
+    "Transcribe the attached video and summarize it into bullet notes.",
+    "Respond with JSON in this format:",
+    '{"transcript":"...","notes":["...","..."]}',
+  ].join("\n");
+}
+
+function parseGeminiText(rawText: string) {
+  try {
+    const parsed = JSON.parse(rawText) as { transcript?: string; notes?: string[] };
+    return {
+      transcript: parsed.transcript?.trim() || "",
+      notes: parsed.notes?.map((note) => `• ${note}`)?.join("\n") || "",
+    };
+  } catch {
+    return {
+      transcript: rawText.trim(),
+      notes: "",
+    };
+  }
+}
+
+function createGeminiClient(apiKey: string) {
+  return new GoogleGenAI({ apiKey });
+}
+
+async function uploadToGeminiFiles(
+  client: GoogleGenAI,
+  file: { file: Blob; fileName: string; mimeType: string }
+) {
+  const uploadedFile = await client.files.upload({
+    file: file.file,
+    config: {
+      displayName: file.fileName,
+      mimeType: file.mimeType,
+    },
+  });
+
+  if (!uploadedFile.uri || !uploadedFile.mimeType) {
+    throw new Error("Gemini file upload missing file metadata.");
+  }
+
+  return {
+    uri: uploadedFile.uri,
+    mimeType: uploadedFile.mimeType,
+  };
+}
 export async function transcribeWithGemini(
   source: GeminiSource
 ): Promise<GeminiResult> {
-  // Simulate latency to mimic a remote call.
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("Missing GEMINI_API_KEY environment variable.");
+  }
 
-  const descriptor =
-    source.type === "youtube"
-      ? `YouTube URL: ${source.videoUrl}`
-      : `Uploaded file: ${source.fileName} (${Math.round(source.sizeBytes / 1024)} KB)`;
+  const client = createGeminiClient(apiKey);
+  const parts: Array<{ text?: string; fileData?: { mimeType: string; fileUri: string } }> = [
+    { text: buildPrompt(source) },
+  ];
+
+  if (source.type === "upload") {
+    const uploadedFile = await uploadToGeminiFiles(client, {
+      file: source.file,
+      fileName: source.fileName,
+      mimeType: source.mimeType,
+    });
+
+    parts.push({
+      fileData: {
+        mimeType: uploadedFile.mimeType,
+        fileUri: uploadedFile.uri,
+      },
+    });
+  }
+
+  const response = await client.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: [
+      {
+        role: "user",
+        parts,
+      },
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 2048,
+    },
+  });
+
+  const rawText = response.text ?? response.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!rawText) {
+    throw new Error("Gemini response missing content.");
+  }
+
+  const parsed = parseGeminiText(rawText);
 
   return {
-    transcript: `Stub transcript for ${descriptor}. Replace this with Gemini output.`,
-    notes:
-      "• Key idea 1\n• Key idea 2\n• Action item: Replace stub with real Gemini integration.\n• Next step: Store results or stream tokens as needed.",
-    model: "gemini-1.5-flash (stub)",
-    estimatedCostUsd: 0.00,
+    transcript: parsed.transcript,
+    notes: parsed.notes,
+    model: GEMINI_MODEL,
+    estimatedCostUsd: 0.0,
   };
 }
