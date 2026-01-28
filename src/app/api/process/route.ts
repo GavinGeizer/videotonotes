@@ -4,6 +4,8 @@ import { transcribeWithGemini, type GeminiSource } from "@/lib/gemini";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+
 export async function POST(req: NextRequest) {
   const contentType = req.headers.get("content-type") || "";
   if (!contentType.includes("multipart/form-data")) {
@@ -37,9 +39,16 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Note: We do not persist the file here. For a real integration, stream to storage (S3, GCS, etc.)
+    if (uploadFile.size > MAX_UPLOAD_BYTES) {
+      return NextResponse.json(
+        { error: "File too large. Please upload a video smaller than 2 GB." },
+        { status: 400 }
+      );
+    }
+
     source = {
       type: "upload",
+      file: uploadFile,
       fileName: uploadFile.name,
       mimeType: uploadFile.type || "video/mp4",
       sizeBytes: uploadFile.size,
@@ -51,7 +60,7 @@ export async function POST(req: NextRequest) {
       if (!parsed.protocol.startsWith("http")) {
         throw new Error("Invalid protocol");
       }
-    } catch (err) {
+    } catch {
       return NextResponse.json(
         { error: "videoUrl must be a valid http(s) link." },
         { status: 400 }
@@ -77,7 +86,7 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (error) {
-    console.error("Gemini stub failed", error);
+    console.error("Gemini request failed", error);
     return NextResponse.json(
       { error: "Failed to process video. Check server logs for details." },
       { status: 500 }
