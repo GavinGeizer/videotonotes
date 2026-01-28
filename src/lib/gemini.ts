@@ -260,9 +260,7 @@ export async function transcribeWithGemini(
         parts,
       },
     ],
-    generationConfig: {
-      temperature: 0.2,
-      maxOutputTokens: 2048,
+    config: {
     },
   });
   await options?.onStatus?.({ phase: "generate-received", model: GEMINI_MODEL });
