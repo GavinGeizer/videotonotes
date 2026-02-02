@@ -28,16 +28,180 @@ type ApiResponse = {
   debug?: { model: string; estimatedCostUsd: number };
 };
 
-type StreamEvent =
-  | { type: "status"; phase: string; message: string; detail?: Record<string, unknown> }
-  | { type: "result"; data: ApiResponse & { ok: true } }
-  | { type: "error"; message: string };
-
 type Status = "idle" | "uploading" | "processing" | "done" | "error";
+type GeminiFile = {
+  name: string;
+  uri: string;
+  mimeType: string;
+  state?: string;
+  error?: { message?: string };
+};
+
+const GEMINI_MODEL = "gemini-3-flash-preview";
+const FILE_ACTIVE_POLL_INITIAL_MS = 100;
+const FILE_ACTIVE_POLL_MAX_MS = 20000;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const buildPrompt = (source: ApiResponse["source"]) => {
+  if (source.type === "youtube") {
+    return [
+      "You are a transcription assistant. If you cannot access the video contents for the URL",
+      "below, respond with a single JSON object that includes an empty transcript and notes plus",
+      "a brief message explaining that the URL cannot be accessed.",
+      `Video URL: ${source.videoUrl ?? ""}`,
+      "",
+      "Respond with JSON in this format:",
+      '{"transcript":"...","notes":["...","..."]}',
+    ].join("\n");
+  }
+
+  return [
+    "Transcribe the attached video and summarize it into bullet notes.",
+    "Respond with JSON in this format:",
+    '{"transcript":"...","notes":["...","..."]}',
+  ].join("\n");
+};
+
+const parseGeminiText = (rawText: string) => {
+  try {
+    const parsed = JSON.parse(rawText) as { transcript?: string; notes?: string[] };
+    return {
+      transcript: parsed.transcript?.trim() || "",
+      notes: parsed.notes?.map((note) => `• ${note}`)?.join("\n") || "",
+    };
+  } catch {
+    return {
+      transcript: rawText.trim(),
+      notes: "",
+    };
+  }
+};
+
+const startGeminiUpload = async (apiKey: string, file: File) => {
+  const startResponse = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": file.size.toString(),
+        "X-Goog-Upload-Header-Content-Type": file.type || "application/octet-stream",
+      },
+      body: JSON.stringify({
+        file: {
+          display_name: file.name,
+        },
+      }),
+    }
+  );
+
+  if (!startResponse.ok) {
+    const bodyText = await startResponse.text();
+    throw new Error(bodyText || "Failed to start Gemini upload session.");
+  }
+
+  const uploadUrl = startResponse.headers.get("x-goog-upload-url");
+  if (!uploadUrl) {
+    throw new Error("Gemini upload URL missing from response.");
+  }
+
+  return uploadUrl;
+};
+
+const uploadGeminiFile = (
+  uploadUrl: string,
+  file: File,
+  onProgress?: (loaded: number, total: number) => void
+) =>
+  new Promise<GeminiFile>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", uploadUrl);
+    xhr.responseType = "text";
+
+    xhr.upload.onprogress = (progressEvent) => {
+      if (!progressEvent.lengthComputable) return;
+      onProgress?.(progressEvent.loaded, progressEvent.total || file.size);
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 400) {
+        reject(new Error(xhr.responseText || "Gemini upload failed."));
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(xhr.responseText) as { file?: GeminiFile };
+        resolve(parsed.file ?? (parsed as GeminiFile));
+      } catch (error) {
+        reject(
+          error instanceof Error
+            ? error
+            : new Error("Could not parse Gemini upload response.")
+        );
+      }
+    };
+
+    xhr.onerror = () => {
+      reject(new Error("Network error during upload."));
+    };
+
+    xhr.setRequestHeader("X-Goog-Upload-Offset", "0");
+    xhr.setRequestHeader("X-Goog-Upload-Command", "upload, finalize");
+    xhr.send(file);
+  });
+
+const waitForGeminiFileActive = async (
+  apiKey: string,
+  fileName: string,
+  onStatus?: (message: string, phase: string) => void
+) => {
+  let delayMs = FILE_ACTIVE_POLL_INITIAL_MS;
+  let attempt = 1;
+
+  while (true) {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${encodeURIComponent(apiKey)}`
+    );
+
+    if (!response.ok) {
+      const bodyText = await response.text();
+      throw new Error(bodyText || "Failed to check Gemini file status.");
+    }
+
+    const file = (await response.json()) as GeminiFile;
+
+    if (file.state === "ACTIVE") {
+      return file;
+    }
+
+    if (file.state && file.state !== "PROCESSING") {
+      throw new Error(
+        `Gemini file ${fileName} is in unexpected state: ${file.state} (${file.error?.message ?? "Unknown error"})`
+      );
+    }
+
+    onStatus?.(
+      `Gemini file still PROCESSING. Backoff attempt ${attempt}; next check in ${(
+        delayMs / 1000
+      ).toFixed(1)}s.`,
+      "file-processing"
+    );
+    await sleep(delayMs);
+    delayMs = Math.min(delayMs * 2, FILE_ACTIVE_POLL_MAX_MS);
+    attempt += 1;
+  }
+};
 
 export default function Home() {
   const [videoUrl, setVideoUrl] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [activeSourceType, setActiveSourceType] = useState<
+    "youtube" | "upload" | null
+  >(null);
   const [status, setStatus] = useState<Status>("idle");
   const [statusDetail, setStatusDetail] = useState<string | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -48,7 +212,7 @@ export default function Home() {
     speedMbps: number | null;
     etaSeconds: number | null;
   } | null>(null);
-  const [serverLog, setServerLog] = useState<Array<{ message: string; phase: string }>>(
+  const [activityLog, setActivityLog] = useState<Array<{ message: string; phase: string }>>(
     []
   );
   const [error, setError] = useState<string | null>(null);
@@ -62,7 +226,7 @@ export default function Home() {
 
   const helperText = useMemo(() => {
     if (status === "uploading")
-      return "Uploading to the server. Keep this tab open while the file transfers.";
+      return "Uploading directly to Gemini. Keep this tab open while the file transfers.";
     if (status === "processing")
       return "Gemini is working on your video. Longer files can take a few minutes.";
     if (status === "done") return "Complete. Review the transcript and notes.";
@@ -73,7 +237,7 @@ export default function Home() {
   const processingPhaseText = useMemo(() => {
     if (status !== "processing") return null;
 
-    if (!file) {
+    if (activeSourceType !== "upload") {
       if (elapsedSeconds < 10) {
         return "Waiting for Gemini to access the YouTube video.";
       }
@@ -90,18 +254,18 @@ export default function Home() {
       return "Gemini is processing the video and extracting the transcript.";
     }
     return "Waiting for Gemini to finish the response.";
-  }, [elapsedSeconds, file, status]);
+  }, [activeSourceType, elapsedSeconds, status]);
 
   const uploadPhaseText = useMemo(() => {
     if (status !== "uploading") return null;
 
     if (!uploadEstimateSeconds) {
-      return "Uploading your video to the server.";
+      return "Uploading your video to Gemini.";
     }
 
     if (elapsedSeconds < uploadEstimateSeconds) {
       const remaining = Math.max(0, uploadEstimateSeconds - elapsedSeconds);
-      return `Uploading your video to the server. About ${formatDuration(remaining)} remaining (estimate).`;
+      return `Uploading your video to Gemini. About ${formatDuration(remaining)} remaining (estimate).`;
     }
 
     if (elapsedSeconds < uploadEstimateSeconds + 20) {
@@ -130,13 +294,14 @@ export default function Home() {
 
   const statusDetailText = statusDetail ?? statusDetailFallback;
 
-  const serverPhaseLabel = useMemo(() => {
-    if (serverLog.length === 0) return null;
-    const phase = serverLog[serverLog.length - 1].phase;
+  const activityPhaseLabel = useMemo(() => {
+    if (activityLog.length === 0) return null;
+    const phase = activityLog[activityLog.length - 1].phase;
     const labels: Record<string, string> = {
       received: "Received",
       processing: "Preparing request",
       uploading: "Uploading to Gemini",
+      "upload-start": "Starting upload",
       "upload-complete": "Upload complete",
       "file-processing": "Gemini processing (backoff)",
       "file-active": "File active",
@@ -144,10 +309,10 @@ export default function Home() {
       "generate-received": "Parsing response",
     };
     return labels[phase] ?? phase;
-  }, [serverLog]);
+  }, [activityLog]);
 
   const phaseLabel = useMemo(() => {
-    if (serverPhaseLabel) return serverPhaseLabel;
+    if (activityPhaseLabel) return activityPhaseLabel;
 
     if (status === "uploading") {
       if (!uploadEstimateSeconds || elapsedSeconds < uploadEstimateSeconds) {
@@ -171,7 +336,7 @@ export default function Home() {
     if (status === "done") return "Complete";
     if (status === "error") return "Error";
     return null;
-  }, [elapsedSeconds, serverPhaseLabel, status, uploadEstimateSeconds]);
+  }, [activityPhaseLabel, elapsedSeconds, status, uploadEstimateSeconds]);
 
   const formattedElapsed = useMemo(() => {
     if (elapsedSeconds <= 0) return null;
@@ -189,8 +354,8 @@ export default function Home() {
     return formatDuration(remaining);
   }, [elapsedSeconds, uploadEstimateSeconds]);
 
-  const appendServerLog = (message: string, phase: string) => {
-    setServerLog((previous) => [...previous.slice(-4), { message, phase }]);
+  const appendActivityLog = (message: string, phase: string) => {
+    setActivityLog((previous) => [...previous.slice(-4), { message, phase }]);
   };
 
   useEffect(() => {
@@ -207,141 +372,174 @@ export default function Home() {
     return () => clearInterval(timer);
   }, [status]);
 
-  function handleSubmit(event: FormEvent) {
+  async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     setError(null);
     setResult(null);
     setStatusDetail(null);
+
+    const trimmedKey = apiKey.trim();
+    if (!trimmedKey) {
+      setError("Enter your Gemini API key to continue.");
+      return;
+    }
 
     if (!videoUrl.trim() && !file) {
       setError("Provide a YouTube link or choose a video file.");
       return;
     }
 
-    const formData = new FormData();
-    if (videoUrl.trim()) formData.append("videoUrl", videoUrl.trim());
-    if (file) formData.append("file", file);
-
     try {
-      setStatus(file ? "uploading" : "processing");
+      const trimmedUrl = videoUrl.trim();
+      setActiveSourceType(null);
+      setStatus(!trimmedUrl && file ? "uploading" : "processing");
       setUploadStats(null);
-      setServerLog([]);
+      setActivityLog([]);
+      let source: ApiResponse["source"];
+      let fileDataPart:
+        | { file_data: { mime_type: string; file_uri: string } }
+        | null = null;
 
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", "/api/process");
-      xhr.responseType = "text";
-
-      const uploadStart = Date.now();
-      let lastResponseIndex = 0;
-      let responseBuffer = "";
-      let hasResult = false;
-      let hadError = false;
-
-      const handleStreamEvent = (event: StreamEvent) => {
-        if (event.type === "status") {
-          setStatus((previous) => (previous === "uploading" ? "processing" : previous));
-          setStatusDetail(event.message);
-          appendServerLog(event.message, event.phase);
-          return;
-        }
-
-        if (event.type === "result") {
-          hasResult = true;
-          setStatusDetail("Formatting the transcript and notes for display.");
-          setResult(event.data);
-          setStatus("done");
-          setStatusDetail("Complete. Transcript and notes are ready.");
-          return;
-        }
-
-        if (event.type === "error") {
-          hadError = true;
-          setStatus("error");
-          setStatusDetail("Request failed before completion.");
-          setError(event.message);
-        }
-      };
-
-      const parseResponseText = () => {
-        const chunk = xhr.responseText.slice(lastResponseIndex);
-        if (!chunk) return;
-        lastResponseIndex = xhr.responseText.length;
-        responseBuffer += chunk;
-
-        const lines = responseBuffer.split("\n");
-        responseBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const parsed = JSON.parse(line) as StreamEvent;
-            handleStreamEvent(parsed);
-          } catch {
-            // Ignore malformed partial chunks.
+      if (trimmedUrl) {
+        try {
+          const parsed = new URL(trimmedUrl);
+          if (!parsed.protocol.startsWith("http")) {
+            throw new Error("Invalid protocol");
           }
+        } catch {
+          throw new Error("videoUrl must be a valid http(s) link.");
         }
-      };
 
-      xhr.upload.onprogress = (progressEvent) => {
-        if (!progressEvent.lengthComputable) return;
-        const now = Date.now();
-        const elapsed = Math.max(0.001, (now - uploadStart) / 1000);
-        const loaded = progressEvent.loaded;
-        const total = progressEvent.total || file?.size || 0;
-        const percent = total > 0 ? (loaded / total) * 100 : 0;
-        const speedBytesPerSecond = loaded / elapsed;
-        const speedMbps = speedBytesPerSecond / (1024 * 1024);
-        const remainingBytes = Math.max(0, total - loaded);
-        const etaSeconds =
-          speedBytesPerSecond > 0 ? Math.round(remainingBytes / speedBytesPerSecond) : null;
+        source = {
+          type: "youtube",
+          videoUrl: trimmedUrl,
+        };
+        setActiveSourceType("youtube");
+      } else if (file) {
+        setActiveSourceType("upload");
+        if (!file.type.startsWith("video/")) {
+          throw new Error(`Unsupported file type: ${file.type || "unknown"}.`);
+        }
+        if (file.size > 2 * 1024 * 1024 * 1024) {
+          throw new Error("File too large. Please upload a video smaller than 2 GB.");
+        }
 
-        setUploadStats({
-          loadedBytes: loaded,
-          totalBytes: total,
-          percent,
-          speedMbps: Number.isFinite(speedMbps) ? speedMbps : null,
-          etaSeconds,
+        setStatusDetail("Starting Gemini Files API upload.");
+        appendActivityLog("Starting Gemini Files API upload.", "upload-start");
+
+        const uploadUrl = await startGeminiUpload(trimmedKey, file);
+        const uploadStart = Date.now();
+        const uploadedFile = await uploadGeminiFile(uploadUrl, file, (loaded, total) => {
+          const now = Date.now();
+          const elapsed = Math.max(0.001, (now - uploadStart) / 1000);
+          const percent = total > 0 ? (loaded / total) * 100 : 0;
+          const speedBytesPerSecond = loaded / elapsed;
+          const speedMbps = speedBytesPerSecond / (1024 * 1024);
+          const remainingBytes = Math.max(0, total - loaded);
+          const etaSeconds =
+            speedBytesPerSecond > 0 ? Math.round(remainingBytes / speedBytesPerSecond) : null;
+
+          setUploadStats({
+            loadedBytes: loaded,
+            totalBytes: total,
+            percent,
+            speedMbps: Number.isFinite(speedMbps) ? speedMbps : null,
+            etaSeconds,
+          });
         });
-      };
 
-      xhr.upload.onload = () => {
+        if (!uploadedFile.uri || !uploadedFile.mimeType || !uploadedFile.name) {
+          throw new Error("Gemini upload response missing file metadata.");
+        }
+
+        appendActivityLog("Gemini upload complete.", "upload-complete");
+
+        if (uploadedFile.state === "PROCESSING") {
+          setStatusDetail("Waiting for Gemini to finish processing the upload.");
+          const activeFile = await waitForGeminiFileActive(
+            trimmedKey,
+            uploadedFile.name,
+            appendActivityLog
+          );
+          uploadedFile.uri = activeFile.uri || uploadedFile.uri;
+          uploadedFile.mimeType = activeFile.mimeType || uploadedFile.mimeType;
+        }
+
         setStatus("processing");
-      };
+        setStatusDetail("Upload complete. Asking Gemini for transcript.");
+        appendActivityLog("Upload complete. Sending generation request.", "generate-start");
 
-      xhr.onprogress = () => {
-        parseResponseText();
-      };
+        fileDataPart = {
+          file_data: {
+            mime_type: uploadedFile.mimeType,
+            file_uri: uploadedFile.uri,
+          },
+        };
 
-      xhr.onload = () => {
-        parseResponseText();
+        source = {
+          type: "upload",
+          fileName: file.name,
+        };
+      } else {
+        throw new Error("Provide a YouTube link or choose a video file.");
+      }
 
-        if (xhr.status >= 400) {
-          try {
-            const body = JSON.parse(xhr.responseText) as { error?: string };
-            throw new Error(body.error || "Request failed");
-          } catch (error) {
-            hadError = true;
-            setStatus("error");
-            setStatusDetail("Request failed before completion.");
-            setError(error instanceof Error ? error.message : "Request failed");
-          }
-          return;
+      const prompt = buildPrompt(source);
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(
+          trimmedKey
+        )}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  { text: prompt },
+                  ...(fileDataPart ? [fileDataPart] : []),
+                ],
+              },
+            ],
+          }),
         }
+      );
 
-        if (!hasResult && !hadError) {
-          setStatus("error");
-          setStatusDetail("Unexpected response from the server.");
-          setError("Unexpected response from the server.");
-        }
+      if (!response.ok) {
+        const bodyText = await response.text();
+        throw new Error(bodyText || "Gemini request failed.");
+      }
+
+      const data = (await response.json()) as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        text?: string;
       };
 
-      xhr.onerror = () => {
-        hadError = true;
-        setStatus("error");
-        setStatusDetail("Network error during upload.");
-        setError("Network error during upload.");
-      };
+      const rawText =
+        data.text ?? data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
-      xhr.send(formData);
+      if (!rawText) {
+        throw new Error("Gemini response missing content.");
+      }
+
+      const parsed = parseGeminiText(rawText);
+
+      setStatusDetail("Formatting the transcript and notes for display.");
+      setResult({
+        transcript: parsed.transcript,
+        notes: parsed.notes,
+        source,
+        debug: {
+          model: GEMINI_MODEL,
+          estimatedCostUsd: 0,
+        },
+      });
+      setStatus("done");
+      setStatusDetail("Complete. Transcript and notes are ready.");
     } catch (err) {
       setStatus("error");
       setStatusDetail("Request failed before completion.");
@@ -360,9 +558,9 @@ export default function Home() {
             Turn videos into transcripts and notes
           </h1>
           <p className="max-w-2xl text-base text-zinc-600">
-            Upload an .mp4 (or .mov/.webm) or drop in a YouTube link. The backend
-            will hand it to Gemini and return a transcript plus a concise note
-            bundle.
+            Upload an .mp4 (or .mov/.webm) or drop in a YouTube link. Your Gemini
+            API key stays in the browser and the file uploads straight to the
+            Gemini Files API.
           </p>
         </header>
 
@@ -424,13 +622,13 @@ export default function Home() {
                 )}
               </div>
             )}
-            {serverLog.length > 0 && (
+            {activityLog.length > 0 && (
               <div className="mt-4 rounded-lg border px-3 py-2 text-xs text-zinc-600 border-zinc-200 bg-white">
                 <p className="text-[11px] uppercase tracking-wide text-zinc-500">
-                  Server updates
+                  Activity updates
                 </p>
                 <div className="mt-2 space-y-1">
-                  {serverLog.map((entry, index) => (
+                  {activityLog.map((entry, index) => (
                     <p key={`${entry.phase}-${index}`}>
                       [{entry.phase}] {entry.message}
                     </p>
@@ -444,6 +642,23 @@ export default function Home() {
               onSubmit={handleSubmit}
               aria-label="video submission form"
             >
+              <label className="flex flex-col gap-2">
+                <span className="text-sm font-medium text-zinc-800">
+                  Gemini API key
+                </span>
+                <input
+                  type="password"
+                  placeholder="Paste your API key"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  className="w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-zinc-400 focus:ring-2 focus:ring-zinc-200"
+                />
+                <span className="text-xs text-zinc-500">
+                  Used only in this browser tab. It is never sent to the server
+                  hosting this app.
+                </span>
+              </label>
+
               <label className="flex flex-col gap-2">
                 <span className="text-sm font-medium text-zinc-800">
                   YouTube link (optional)
