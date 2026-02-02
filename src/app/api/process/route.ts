@@ -3,7 +3,9 @@ import {
   transcribeWithGemini,
   type GeminiSource,
   type GeminiStatusUpdate,
-} from "@/lib/gemini";
+} from "../../../lib/gemini";
+import { createLogger, createRequestId, serializeError } from "../../../lib/logger";
+import { trackEvent, trackSpan } from "../../../lib/telemetry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -95,8 +97,24 @@ function mapStatus(update: GeminiStatusUpdate): StreamEvent {
 }
 
 export async function POST(req: NextRequest) {
+  const requestId = createRequestId();
+  const logger = createLogger({
+    scope: "api/process",
+    requestId,
+    baseMeta: { method: req.method },
+  });
+  const telemetryContext = {
+    requestId,
+    route: "/api/process",
+    userAgent: req.headers.get("user-agent"),
+  };
+
   const contentType = req.headers.get("content-type") || "";
+  logger.info("Request received.", { contentType });
+  trackEvent("process_request_received", { contentType }, telemetryContext, logger);
   if (!contentType.includes("multipart/form-data")) {
+    logger.warn("Unsupported content type.", { contentType });
+    trackEvent("process_invalid_content_type", { contentType }, telemetryContext, logger);
     return NextResponse.json(
       { error: "Use multipart/form-data with fields: videoUrl (optional) and file (optional)." },
       { status: 400 }
@@ -134,6 +152,8 @@ export async function POST(req: NextRequest) {
       const uploadFile = file instanceof File ? file : null;
 
       if (!videoUrl && !uploadFile) {
+        logger.warn("Missing video input.");
+        trackEvent("process_missing_input", {}, telemetryContext, logger);
         await send({
           type: "error",
           message: "Provide a YouTube URL or upload a video file (.mp4, .mov, .webm).",
@@ -145,6 +165,13 @@ export async function POST(req: NextRequest) {
 
       if (uploadFile) {
         if (!uploadFile.type.startsWith("video/")) {
+          logger.warn("Unsupported upload mime type.", { mimeType: uploadFile.type });
+          trackEvent(
+            "process_invalid_upload_type",
+            { mimeType: uploadFile.type },
+            telemetryContext,
+            logger
+          );
           await send({
             type: "error",
             message: `Unsupported file type: ${uploadFile.type || "unknown"}.`,
@@ -153,6 +180,16 @@ export async function POST(req: NextRequest) {
         }
 
         if (uploadFile.size > MAX_UPLOAD_BYTES) {
+          logger.warn("Upload exceeds size limit.", {
+            sizeBytes: uploadFile.size,
+            maxBytes: MAX_UPLOAD_BYTES,
+          });
+          trackEvent(
+            "process_upload_too_large",
+            { sizeBytes: uploadFile.size, maxBytes: MAX_UPLOAD_BYTES },
+            telemetryContext,
+            logger
+          );
           await send({
             type: "error",
             message: "File too large. Please upload a video smaller than 2 GB.",
@@ -175,6 +212,8 @@ export async function POST(req: NextRequest) {
             throw new Error("Invalid protocol");
           }
         } catch {
+          logger.warn("Invalid video URL supplied.", { videoUrl });
+          trackEvent("process_invalid_video_url", { videoUrl }, telemetryContext, logger);
           await send({
             type: "error",
             message: "videoUrl must be a valid http(s) link.",
@@ -188,18 +227,39 @@ export async function POST(req: NextRequest) {
         };
       }
 
+      logger.info("Input validated; starting Gemini processing.", {
+        sourceType: source.type,
+      });
+      trackEvent(
+        "process_start_gemini",
+        { sourceType: source.type },
+        telemetryContext,
+        logger
+      );
       await send({
         type: "status",
         phase: "processing",
         message: "Calling Gemini with the prepared request.",
       });
 
-      const result = await transcribeWithGemini(source, {
-        onStatus: async (update) => {
-          await send(mapStatus(update));
-        },
-      });
+      const result = await trackSpan(
+        "gemini_transcribe",
+        () =>
+          transcribeWithGemini(source, {
+            onStatus: async (update) => {
+              await send(mapStatus(update));
+            },
+            logger: logger.child({ subsystem: "gemini" }),
+          }),
+        {
+          data: { sourceType: source.type },
+          context: telemetryContext,
+          logger,
+        }
+      );
 
+      logger.info("Gemini processing complete.", { sourceType: source.type });
+      trackEvent("process_success", { sourceType: source.type }, telemetryContext, logger);
       await send({
         type: "result",
         data: {
@@ -214,12 +274,19 @@ export async function POST(req: NextRequest) {
         },
       });
     } catch (error) {
-      console.error("Gemini request failed", error);
+      logger.error("Gemini request failed.", { error: serializeError(error) });
+      trackEvent(
+        "process_error",
+        { error: serializeError(error) },
+        telemetryContext,
+        logger
+      );
       await send({
         type: "error",
         message: "Failed to process video. Check server logs for details.",
       });
     } finally {
+      logger.info("Request stream closed.");
       await writer.close();
     }
   })();

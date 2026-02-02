@@ -1,4 +1,5 @@
 import { FileState, GoogleGenAI } from "@google/genai";
+import { createLogger, type Logger } from "./logger";
 
 export type GeminiSource =
   | {
@@ -62,7 +63,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitForFileActive(
   client: GoogleGenAI,
   fileName: string,
-  onStatus?: GeminiStatusHandler
+  onStatus?: GeminiStatusHandler,
+  logger?: Logger
 ) {
   let delayMs = FILE_ACTIVE_POLL_INITIAL_MS;
   let attempt = 1;
@@ -73,13 +75,13 @@ async function waitForFileActive(
 
     if (state === FileState.ACTIVE) {
       await onStatus?.({ phase: "file-active", fileName });
-      console.info("[gemini] File is active.", { name: fileName });
+      logger?.info("Gemini file is active.", { name: fileName });
       return file;
     }
 
     if (state !== FileState.PROCESSING) {
       const errorMessage = file.error?.message ?? "Unknown error.";
-      console.error("[gemini] File processing failed.", {
+      logger?.error("Gemini file processing failed.", {
         name: fileName,
         state,
         errorMessage,
@@ -89,7 +91,7 @@ async function waitForFileActive(
       );
     }
 
-    console.info("[gemini] File still processing; backing off.", {
+    logger?.info("Gemini file still processing; backing off.", {
       name: fileName,
       attempt,
       nextDelayMs: delayMs,
@@ -149,7 +151,8 @@ function createGeminiClient(apiKey: string) {
 async function uploadToGeminiFiles(
   client: GoogleGenAI,
   file: { file: Blob; fileName: string; mimeType: string; sizeBytes: number },
-  onStatus?: GeminiStatusHandler
+  onStatus?: GeminiStatusHandler,
+  logger?: Logger
 ) {
   await onStatus?.({
     phase: "upload-start",
@@ -157,7 +160,7 @@ async function uploadToGeminiFiles(
     mimeType: file.mimeType,
     sizeBytes: file.sizeBytes,
   });
-  console.info("[gemini] Starting Gemini file upload.", {
+  logger?.info("Starting Gemini file upload.", {
     fileName: file.fileName,
     mimeType: file.mimeType,
     sizeBytes: file.file.size,
@@ -171,7 +174,7 @@ async function uploadToGeminiFiles(
     },
   });
 
-  console.info("[gemini] Gemini file upload complete.", {
+  logger?.info("Gemini file upload complete.", {
     name: uploadedFile.name,
     uri: uploadedFile.uri,
     mimeType: uploadedFile.mimeType,
@@ -188,13 +191,13 @@ async function uploadToGeminiFiles(
   }
 
   if (uploadedFile.state === FileState.PROCESSING) {
-    console.info("[gemini] Waiting for Gemini file to become active.", {
+    logger?.info("Waiting for Gemini file to become active.", {
       name: uploadedFile.name,
     });
-    await waitForFileActive(client, uploadedFile.name, onStatus);
+    await waitForFileActive(client, uploadedFile.name, onStatus, logger);
   } else if (uploadedFile.state !== FileState.ACTIVE) {
     const errorMessage = uploadedFile.error?.message ?? "Unknown error.";
-    console.error("[gemini] Gemini file in unexpected state after upload.", {
+    logger?.error("Gemini file in unexpected state after upload.", {
       name: uploadedFile.name,
       state: uploadedFile.state,
       errorMessage,
@@ -203,7 +206,7 @@ async function uploadToGeminiFiles(
       `Gemini file ${uploadedFile.name} is in unexpected state: ${uploadedFile.state ?? "unknown"} (${errorMessage})`
     );
   } else {
-    console.info("[gemini] Gemini file already active.", { name: uploadedFile.name });
+    logger?.info("Gemini file already active.", { name: uploadedFile.name });
   }
 
   return {
@@ -214,13 +217,14 @@ async function uploadToGeminiFiles(
 }
 export async function transcribeWithGemini(
   source: GeminiSource,
-  options?: { onStatus?: GeminiStatusHandler }
+  options?: { onStatus?: GeminiStatusHandler; logger?: Logger }
 ): Promise<GeminiResult> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("Missing GEMINI_API_KEY environment variable.");
   }
 
+  const logger = options?.logger ?? createLogger({ scope: "gemini" });
   const client = createGeminiClient(apiKey);
   const parts: Array<{ text?: string; fileData?: { mimeType: string; fileUri: string } }> = [
     { text: buildPrompt(source) },
@@ -235,10 +239,11 @@ export async function transcribeWithGemini(
         mimeType: source.mimeType,
         sizeBytes: source.sizeBytes,
       },
-      options?.onStatus
+      options?.onStatus,
+      logger
     );
 
-    console.info("[gemini] Attaching uploaded file to request.", {
+    logger.info("Attaching uploaded file to request.", {
       name: uploadedFile.name,
       uri: uploadedFile.uri,
     });

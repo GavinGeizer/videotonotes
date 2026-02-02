@@ -23,9 +23,10 @@ const formatBytes = (bytes: number) => {
 
 type ApiResponse = {
   transcript: string;
-  notes: string;
+  notes: string[];
   source: { type: "youtube" | "upload"; videoUrl?: string; fileName?: string };
   debug?: { model: string; estimatedCostUsd: number };
+  rawResponse?: string;
 };
 
 type Status = "idle" | "uploading" | "processing" | "done" | "error";
@@ -63,17 +64,55 @@ const buildPrompt = (source: ApiResponse["source"]) => {
   ].join("\n");
 };
 
+const stripCodeFence = (rawText: string) =>
+  rawText
+    .trim()
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/i, "")
+    .trim();
+
+const normalizeNotes = (notes: unknown): string[] => {
+  if (Array.isArray(notes)) {
+    return notes.map((note) => String(note).trim()).filter(Boolean);
+  }
+  if (typeof notes === "string") {
+    return notes
+      .split("\n")
+      .map((line) => line.replace(/^[-•\s]+/, "").trim())
+      .filter(Boolean);
+  }
+  return [];
+};
+
 const parseGeminiText = (rawText: string) => {
-  try {
-    const parsed = JSON.parse(rawText) as { transcript?: string; notes?: string[] };
+  const cleanedText = stripCodeFence(rawText);
+
+  const tryParse = (text: string) => {
+    const parsed = JSON.parse(text) as { transcript?: string; notes?: unknown };
     return {
       transcript: parsed.transcript?.trim() || "",
-      notes: parsed.notes?.map((note) => `• ${note}`)?.join("\n") || "",
+      notes: normalizeNotes(parsed.notes),
     };
+  };
+
+  try {
+    return { ...tryParse(cleanedText), rawResponse: null as string | null };
   } catch {
+    try {
+      const firstBrace = cleanedText.indexOf("{");
+      const lastBrace = cleanedText.lastIndexOf("}");
+      if (firstBrace >= 0 && lastBrace > firstBrace) {
+        const extracted = cleanedText.slice(firstBrace, lastBrace + 1);
+        return { ...tryParse(extracted), rawResponse: null as string | null };
+      }
+    } catch {
+      // Fall through to raw response fallback.
+    }
+
     return {
-      transcript: rawText.trim(),
-      notes: "",
+      transcript: cleanedText.trim(),
+      notes: [],
+      rawResponse: cleanedText.trim(),
     };
   }
 };
@@ -537,6 +576,7 @@ export default function Home() {
           model: GEMINI_MODEL,
           estimatedCostUsd: 0,
         },
+        rawResponse: parsed.rawResponse ?? undefined,
       });
       setStatus("done");
       setStatusDetail("Complete. Transcript and notes are ready.");
@@ -753,10 +793,32 @@ export default function Home() {
                   <p className="text-xs uppercase tracking-wide text-zinc-500">
                     Notes
                   </p>
-                  <pre className="mt-2 whitespace-pre-wrap text-sm text-zinc-800">
-                    {result.notes}
-                  </pre>
+                  {result.notes.length > 0 ? (
+                    <ul className="mt-2 space-y-2 text-sm text-zinc-800">
+                      {result.notes.map((note, index) => (
+                        <li key={`${note}-${index}`} className="flex gap-2">
+                          <span className="mt-2 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-zinc-400" />
+                          <span>{note}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-2 text-sm text-zinc-600">
+                      No notes were returned. Check the raw response below if needed.
+                    </p>
+                  )}
                 </div>
+
+                {result.rawResponse && (
+                  <details className="rounded-lg border border-zinc-200 bg-white px-4 py-3 text-sm text-zinc-700">
+                    <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                      Raw response
+                    </summary>
+                    <pre className="mt-3 whitespace-pre-wrap text-xs text-zinc-600">
+                      {result.rawResponse}
+                    </pre>
+                  </details>
+                )}
 
                 <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
                   <span className="rounded-full bg-zinc-100 px-3 py-1">
